@@ -1,0 +1,166 @@
+package models
+
+import (
+	"time"
+
+	"go.mongodb.org/mongo-driver/bson/primitive"
+)
+
+/* ───────────── Plans (from webxterm.me/pricing — plan-based, no pay-as-you-go) ───────────── */
+
+type Plan struct {
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	RatePerMachine int    `json:"rate_per_machine"` // ₹ / machine / month (0 = free or custom)
+	MaxMachines    int    `json:"max_machines"`     // -1 = unlimited (Enterprise)
+	Trial          bool   `json:"trial"`
+	Description    string `json:"description"`
+}
+
+var Plans = map[string]Plan{
+	"community":    {ID: "community", Name: "Community", RatePerMachine: 0, MaxMachines: 10, Trial: true, Description: "Free for 30 days · up to 10 machines"},
+	"professional": {ID: "professional", Name: "Professional", RatePerMachine: 499, MaxMachines: 100, Description: "₹499 / machine / month · up to 100 machines"},
+	"business":     {ID: "business", Name: "Business", RatePerMachine: 399, MaxMachines: 500, Description: "₹399 / machine / month · up to 500 machines"},
+	"enterprise":   {ID: "enterprise", Name: "Enterprise", RatePerMachine: 0, MaxMachines: -1, Description: "Custom quote · unlimited machines"},
+}
+
+// PlanOrder keeps a stable display order for the UI.
+var PlanOrder = []string{"community", "professional", "business", "enterprise"}
+
+/* ───────────── License status state machine ───────────── */
+
+const (
+	StatusTrial     = "trial"
+	StatusConfirmed = "confirmed"
+	StatusSuspended = "suspended"
+	StatusExpired   = "expired"
+	StatusRevoked   = "revoked"
+)
+
+/* ───────────── Entities ───────────── */
+
+/* ───────────── Portal user roles ─────────────
+   superadmin — full access (SMTP, audit log, user management included)
+   admin      — team member: everything except SMTP, audit log & user management */
+
+const (
+	RoleSuperadmin = "superadmin"
+	RoleAdmin      = "admin"
+)
+
+type AdminUser struct {
+	ID           primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	Email        string             `bson:"email" json:"email"`
+	PasswordHash string             `bson:"password_hash" json:"-"`
+	Role         string             `bson:"role" json:"role"`
+	CreatedBy    string             `bson:"created_by,omitempty" json:"created_by,omitempty"`
+	CreatedAt    time.Time          `bson:"created_at" json:"created_at"`
+}
+
+type Customer struct {
+	ID          primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	CompanyName string             `bson:"company_name" json:"company_name"`
+	Email       string             `bson:"email" json:"email"`
+	Phone       string             `bson:"phone" json:"phone"`
+	CreatedAt   time.Time          `bson:"created_at" json:"created_at"`
+}
+
+type License struct {
+	ID             primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	CustomerID     primitive.ObjectID `bson:"customer_id" json:"customer_id"`
+	PublicID       string             `bson:"public_id" json:"public_id"` // e.g. LIC-XXXXXXXX
+	Plan           string             `bson:"plan" json:"plan"`
+	MachineQuota   int                `bson:"machine_quota" json:"machine_quota"`
+	CustomRate     int                `bson:"custom_rate,omitempty" json:"custom_rate,omitempty"` // Enterprise negotiated ₹/machine/mo
+	Status         string             `bson:"status" json:"status"`
+	UpdatesGranted bool               `bson:"updates_granted" json:"updates_granted"`
+	UpdateChannel  string             `bson:"update_channel" json:"update_channel"` // allowed version, e.g. "1.4.x"
+	DeploymentURL  string             `bson:"deployment_url" json:"deployment_url"`
+	APIKeyHash     string             `bson:"api_key_hash" json:"-"`
+	TrialExpiresAt *time.Time         `bson:"trial_expires_at,omitempty" json:"trial_expires_at,omitempty"`
+	ExpiresAt      *time.Time         `bson:"expires_at,omitempty" json:"expires_at,omitempty"` // paid-license expiry (renewal)
+	ActivatedAt    *time.Time         `bson:"activated_at,omitempty" json:"activated_at,omitempty"`
+	LastSeenAt     *time.Time         `bson:"last_seen_at,omitempty" json:"last_seen_at,omitempty"`
+	ProductVersion string             `bson:"product_version,omitempty" json:"product_version,omitempty"`
+	AmountPaid     bool               `bson:"amount_paid" json:"amount_paid"`
+	CreatedAt      time.Time          `bson:"created_at" json:"created_at"`
+	UpdatedAt      time.Time          `bson:"updated_at" json:"updated_at"`
+}
+
+// EffectiveExpiry returns the date after which the license is no longer valid.
+func (l *License) EffectiveExpiry() *time.Time {
+	if l.Status == StatusTrial {
+		return l.TrialExpiresAt
+	}
+	return l.ExpiresAt
+}
+
+type Machine struct {
+	ID            primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	LicenseID     primitive.ObjectID `bson:"license_id" json:"license_id"`
+	Fingerprint   string             `bson:"fingerprint" json:"fingerprint"`
+	Name          string             `bson:"name,omitempty" json:"name,omitempty"`
+	TenantRef     string             `bson:"tenant_ref,omitempty" json:"tenant_ref,omitempty"`
+	Active        bool               `bson:"active" json:"active"`
+	FirstSeen     time.Time          `bson:"first_seen" json:"first_seen"`
+	LastHeartbeat time.Time          `bson:"last_heartbeat" json:"last_heartbeat"`
+}
+
+type QuotaRequest struct {
+	ID             primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	LicenseID      primitive.ObjectID `bson:"license_id" json:"license_id"`
+	RequestedDelta int                `bson:"requested_delta" json:"requested_delta"`
+	Reason         string             `bson:"reason,omitempty" json:"reason,omitempty"`
+	Status         string             `bson:"status" json:"status"` // pending · approved · rejected
+	RequestedAt    time.Time          `bson:"requested_at" json:"requested_at"`
+	DecidedAt      *time.Time         `bson:"decided_at,omitempty" json:"decided_at,omitempty"`
+	DecidedBy      string             `bson:"decided_by,omitempty" json:"decided_by,omitempty"`
+	Note           string             `bson:"note,omitempty" json:"note,omitempty"`
+}
+
+type LicenseHistory struct {
+	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	LicenseID primitive.ObjectID `bson:"license_id" json:"license_id"`
+	Field     string             `bson:"field" json:"field"`
+	OldValue  string             `bson:"old_value" json:"old_value"`
+	NewValue  string             `bson:"new_value" json:"new_value"`
+	Actor     string             `bson:"actor" json:"actor"`
+	Reason    string             `bson:"reason,omitempty" json:"reason,omitempty"`
+	ChangedAt time.Time          `bson:"changed_at" json:"changed_at"`
+}
+
+type Payment struct {
+	ID           primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	LicenseID    primitive.ObjectID `bson:"license_id" json:"license_id"`
+	Amount       int                `bson:"amount" json:"amount"`
+	Currency     string             `bson:"currency" json:"currency"`
+	Method       string             `bson:"method" json:"method"`
+	Reference    string             `bson:"reference,omitempty" json:"reference,omitempty"`
+	PaidAt       time.Time          `bson:"paid_at" json:"paid_at"`
+	CoversPeriod string             `bson:"covers_period,omitempty" json:"covers_period,omitempty"`
+}
+
+type AuditEntry struct {
+	ID       primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	Actor    string             `bson:"actor" json:"actor"`
+	Action   string             `bson:"action" json:"action"`
+	Target   string             `bson:"target" json:"target"`
+	Metadata string             `bson:"metadata,omitempty" json:"metadata,omitempty"`
+	At       time.Time          `bson:"at" json:"at"`
+}
+
+type SMTPConfig struct {
+	ID       string `bson:"_id" json:"-"` // singleton: "smtp"
+	Host     string `bson:"host" json:"host"`
+	Port     int    `bson:"port" json:"port"`
+	Username string `bson:"username" json:"username"`
+	Password string `bson:"password" json:"password"` // returned masked by the API
+	From     string `bson:"from" json:"from"`
+}
+
+type SigningKeys struct {
+	ID         string    `bson:"_id" json:"-"` // singleton: "ed25519"
+	PrivateB64 string    `bson:"private_b64" json:"-"`
+	PublicB64  string    `bson:"public_b64" json:"public_b64"`
+	CreatedAt  time.Time `bson:"created_at" json:"created_at"`
+}
