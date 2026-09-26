@@ -6,7 +6,26 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
-/* ───────────── Plans (from webxterm.me/pricing — plan-based, no pay-as-you-go) ───────────── */
+// PAM and EPM share this backend/database; only License is product-scoped.
+const (
+	ProductPAM = "pam"
+	ProductEPM = "epm"
+)
+
+func ValidProduct(p string) bool {
+	return p == ProductPAM || p == ProductEPM
+}
+
+// NormalizeProduct treats "" as ProductPAM, for licenses created before this field existed.
+func NormalizeProduct(p string) string {
+	if p == "" {
+		return ProductPAM
+	}
+	return p
+}
+
+/* ───────────── Plans (from webxterm.me/pricing) ───────────── */
+// Per-product — three tiers each: Community, Professional, Enterprise.
 
 type Plan struct {
 	ID             string `json:"id"`
@@ -17,15 +36,39 @@ type Plan struct {
 	Description    string `json:"description"`
 }
 
-var Plans = map[string]Plan{
+// PAM Enterprise is priced per number of machines, negotiated per customer —
+// see License.CustomRate, set by the admin at onboarding/renewal time.
+var pamPlans = map[string]Plan{
 	"community":    {ID: "community", Name: "Community", RatePerMachine: 0, MaxMachines: 10, Trial: true, Description: "Free for 30 days · up to 10 machines"},
 	"professional": {ID: "professional", Name: "Professional", RatePerMachine: 499, MaxMachines: 100, Description: "₹499 / machine / month · up to 100 machines"},
-	"business":     {ID: "business", Name: "Business", RatePerMachine: 399, MaxMachines: 500, Description: "₹399 / machine / month · up to 500 machines"},
 	"enterprise":   {ID: "enterprise", Name: "Enterprise", RatePerMachine: 0, MaxMachines: -1, Description: "Custom quote · unlimited machines"},
 }
 
-// PlanOrder keeps a stable display order for the UI.
-var PlanOrder = []string{"community", "professional", "business", "enterprise"}
+// EPM Enterprise has a fixed per-machine rate rather than a custom quote.
+var epmPlans = map[string]Plan{
+	"community":    {ID: "community", Name: "Community", RatePerMachine: 0, MaxMachines: 10, Trial: true, Description: "Free for 30 days · up to 10 machines"},
+	"professional": {ID: "professional", Name: "Professional", RatePerMachine: 659, MaxMachines: 100, Description: "₹659 / machine / month · up to 100 machines"},
+	"enterprise":   {ID: "enterprise", Name: "Enterprise", RatePerMachine: 499, MaxMachines: -1, Description: "₹499 / machine / month · unlimited machines"},
+}
+
+var plansByProduct = map[string]map[string]Plan{
+	ProductPAM: pamPlans,
+	ProductEPM: epmPlans,
+}
+
+// planOrder is the stable display order for the UI.
+var planOrder = []string{"community", "professional", "enterprise"}
+
+func ProductPlans(product string) map[string]Plan {
+	if p, ok := plansByProduct[NormalizeProduct(product)]; ok {
+		return p
+	}
+	return pamPlans
+}
+
+func ProductPlanOrder(product string) []string {
+	return planOrder
+}
 
 /* ───────────── License status state machine ───────────── */
 
@@ -57,8 +100,12 @@ type AdminUser struct {
 	CreatedAt    time.Time          `bson:"created_at" json:"created_at"`
 }
 
+// Customer is matched by email across onboardings — one company with both
+// a PAM and an EPM license is ONE Customer document with Products holding
+// both, not two separate rows.
 type Customer struct {
 	ID          primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	Products    []string           `bson:"products" json:"products"`
 	CompanyName string             `bson:"company_name" json:"company_name"`
 	Email       string             `bson:"email" json:"email"`
 	Phone       string             `bson:"phone" json:"phone"`
@@ -68,7 +115,8 @@ type Customer struct {
 type License struct {
 	ID             primitive.ObjectID `bson:"_id,omitempty" json:"id"`
 	CustomerID     primitive.ObjectID `bson:"customer_id" json:"customer_id"`
-	PublicID       string             `bson:"public_id" json:"public_id"` // e.g. LIC-XXXXXXXX
+	Product        string             `bson:"product" json:"product"`     // "pam" or "epm" — see ProductPAM/ProductEPM. Never changes after creation.
+	PublicID       string             `bson:"public_id" json:"public_id"` // e.g. LIC-XXXXXXXX (pam) or EPM-XXXXXXXX (epm)
 	Plan           string             `bson:"plan" json:"plan"`
 	MachineQuota   int                `bson:"machine_quota" json:"machine_quota"`
 	CustomRate     int                `bson:"custom_rate,omitempty" json:"custom_rate,omitempty"` // Enterprise negotiated ₹/machine/mo
@@ -76,7 +124,16 @@ type License struct {
 	UpdatesGranted bool               `bson:"updates_granted" json:"updates_granted"`
 	UpdateChannel  string             `bson:"update_channel" json:"update_channel"` // allowed version, e.g. "1.4.x"
 	DeploymentURL  string             `bson:"deployment_url" json:"deployment_url"`
-	APIKeyHash     string             `bson:"api_key_hash" json:"-"`
+	// Exposed to the admin portal only (never to deployment-facing /api/v1/*,
+	// which builds its own response fields rather than marshaling this struct)
+	// so support can compare a customer-supplied key's hash without ever
+	// storing or re-showing the plaintext key.
+	APIKeyHash string `bson:"api_key_hash" json:"api_key_hash"`
+	// PrevAPIKeyHash keeps the just-rotated-out key valid until PrevAPIKeyExpiresAt
+	// — an overlap window so an admin has time to update LICENSE_API_KEY on
+	// the deployment before the old one stops working. See config.KeyRotationGrace.
+	PrevAPIKeyHash      string     `bson:"prev_api_key_hash,omitempty" json:"-"`
+	PrevAPIKeyExpiresAt *time.Time `bson:"prev_api_key_expires_at,omitempty" json:"prev_api_key_expires_at,omitempty"`
 	TrialExpiresAt *time.Time         `bson:"trial_expires_at,omitempty" json:"trial_expires_at,omitempty"`
 	ExpiresAt      *time.Time         `bson:"expires_at,omitempty" json:"expires_at,omitempty"` // paid-license expiry (renewal)
 	ActivatedAt    *time.Time         `bson:"activated_at,omitempty" json:"activated_at,omitempty"`
@@ -95,9 +152,15 @@ func (l *License) EffectiveExpiry() *time.Time {
 	return l.ExpiresAt
 }
 
+// GetProduct normalizes the stored Product — see NormalizeProduct.
+func (l *License) GetProduct() string {
+	return NormalizeProduct(l.Product)
+}
+
 type Machine struct {
 	ID            primitive.ObjectID `bson:"_id,omitempty" json:"id"`
 	LicenseID     primitive.ObjectID `bson:"license_id" json:"license_id"`
+	Product       string             `bson:"product" json:"product"` // copied from the owning license
 	Fingerprint   string             `bson:"fingerprint" json:"fingerprint"`
 	Name          string             `bson:"name,omitempty" json:"name,omitempty"`
 	TenantRef     string             `bson:"tenant_ref,omitempty" json:"tenant_ref,omitempty"`
@@ -109,6 +172,7 @@ type Machine struct {
 type QuotaRequest struct {
 	ID             primitive.ObjectID `bson:"_id,omitempty" json:"id"`
 	LicenseID      primitive.ObjectID `bson:"license_id" json:"license_id"`
+	Product        string             `bson:"product" json:"product"` // copied from the owning license
 	RequestedDelta int                `bson:"requested_delta" json:"requested_delta"`
 	Reason         string             `bson:"reason,omitempty" json:"reason,omitempty"`
 	Status         string             `bson:"status" json:"status"` // pending · approved · rejected
@@ -121,6 +185,7 @@ type QuotaRequest struct {
 type LicenseHistory struct {
 	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
 	LicenseID primitive.ObjectID `bson:"license_id" json:"license_id"`
+	Product   string             `bson:"product" json:"product"` // copied from the owning license
 	Field     string             `bson:"field" json:"field"`
 	OldValue  string             `bson:"old_value" json:"old_value"`
 	NewValue  string             `bson:"new_value" json:"new_value"`
@@ -132,6 +197,7 @@ type LicenseHistory struct {
 type Payment struct {
 	ID           primitive.ObjectID `bson:"_id,omitempty" json:"id"`
 	LicenseID    primitive.ObjectID `bson:"license_id" json:"license_id"`
+	Product      string             `bson:"product" json:"product"` // copied from the owning license
 	Amount       int                `bson:"amount" json:"amount"`
 	Currency     string             `bson:"currency" json:"currency"`
 	Method       string             `bson:"method" json:"method"`

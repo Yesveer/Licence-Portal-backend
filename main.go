@@ -32,7 +32,7 @@ func main() {
 	r := gin.Default()
 	corsCfg := cors.Config{
 		AllowMethods: []string{"GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"},
-		AllowHeaders: []string{"Origin", "Content-Type", "Authorization", "X-API-Key"},
+		AllowHeaders: []string{"Origin", "Content-Type", "Authorization", "X-API-Key", "X-Product"},
 		MaxAge:       12 * time.Hour,
 	}
 	if strings.TrimSpace(cfg.CORSOrigins) == "*" {
@@ -51,18 +51,24 @@ func main() {
 	admin.POST("/login", h.Login)
 	authed := admin.Group("", middleware.AdminAuth(cfg.JWTSecret))
 	{
-		authed.GET("/dashboard", h.Dashboard)
-		authed.GET("/plans", h.ListPlans)
-		authed.POST("/customers", h.OnboardCustomer)
-		authed.GET("/licenses", h.ListLicenses)
-		authed.GET("/licenses/:id", h.GetLicense)
-		authed.PATCH("/licenses/:id", h.UpdateLicense)
-		authed.POST("/licenses/:id/rotate-key", h.RotateAPIKey)
-		authed.POST("/licenses/:id/payments", h.RecordPayment)
-		authed.GET("/quota-requests", h.ListQuotaRequests)
-		authed.POST("/quota-requests/:id/decide", h.DecideQuotaRequest)
+		// Requires X-Product: pam|epm — scopes PAM's/EPM's own licenses.
+		scoped := authed.Group("", middleware.ProductScope())
+		{
+			scoped.GET("/dashboard", h.Dashboard)
+			scoped.GET("/plans", h.ListPlans)
+			scoped.POST("/customers", h.OnboardCustomer)
+			scoped.GET("/licenses", h.ListLicenses)
+			scoped.GET("/licenses/:id", h.GetLicense)
+			scoped.PATCH("/licenses/:id", h.UpdateLicense)
+			scoped.POST("/licenses/:id/rotate-key", h.RotateAPIKey)
+			scoped.POST("/licenses/:id/upgrade", h.UpgradeLicense)
+			scoped.POST("/licenses/:id/status", h.SetLicenseStatus)
+			scoped.POST("/licenses/:id/payments", h.RecordPayment)
+			scoped.GET("/quota-requests", h.ListQuotaRequests)
+			scoped.POST("/quota-requests/:id/decide", h.DecideQuotaRequest)
+		}
 
-		// superadmin-only: SMTP settings, audit log, user management
+		// superadmin-only, shared across both products (not product-scoped).
 		sa := authed.Group("", middleware.RequireSuperadmin())
 		{
 			sa.GET("/smtp", h.GetSMTP)

@@ -39,10 +39,15 @@ func (s *Store) ensureIndexes(ctx context.Context) {
 	s.DB.Collection("admin_users").Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys: bson.D{{Key: "email", Value: 1}}, Options: uniq,
 	})
+	s.DB.Collection("customers").Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{Key: "email", Value: 1}}, Options: uniq,
+	})
 	s.DB.Collection("licenses").Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{Keys: bson.D{{Key: "public_id", Value: 1}}, Options: uniq},
 		{Keys: bson.D{{Key: "api_key_hash", Value: 1}}},
 		{Keys: bson.D{{Key: "status", Value: 1}}},
+		// Licenses are scoped by product first — see middleware.ProductScope.
+		{Keys: bson.D{{Key: "product", Value: 1}, {Key: "status", Value: 1}}},
 	})
 	s.DB.Collection("machines").Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys:    bson.D{{Key: "license_id", Value: 1}, {Key: "fingerprint", Value: 1}},

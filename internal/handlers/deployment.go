@@ -12,20 +12,6 @@ import (
 	"license-portal-backend/internal/models"
 )
 
-// checkLifecycle flips a trial/paid license to expired when its date passed.
-// Returns the (possibly updated) status.
-func (h *Handler) checkLifecycle(c *gin.Context, lic *models.License) string {
-	exp := lic.EffectiveExpiry()
-	if exp != nil && time.Now().After(*exp) && (lic.Status == models.StatusTrial || lic.Status == models.StatusConfirmed) {
-		ctx, cancel := reqCtx(c)
-		defer cancel()
-		h.Store.C("licenses").UpdateByID(ctx, lic.ID, bson.M{"$set": bson.M{"status": models.StatusExpired, "updated_at": time.Now().UTC()}})
-		h.history(lic.ID, "status", lic.Status, models.StatusExpired, "system", "expiry reached")
-		lic.Status = models.StatusExpired
-	}
-	return lic.Status
-}
-
 func (h *Handler) companyOf(c *gin.Context, lic *models.License) string {
 	ctx, cancel := reqCtx(c)
 	defer cancel()
@@ -44,7 +30,21 @@ func (h *Handler) Activate(c *gin.Context) {
 	c.ShouldBindJSON(&req) // body optional
 
 	lic := middleware.LicenseFrom(c)
-	h.checkLifecycle(c, lic)
+
+	// Soft deployment lock: once a deployment_url is on record, a DIFFERENT
+	// one asserting itself is refused — the same key can't be silently reused
+	// to stand up a second, separate customer environment. This only catches
+	// a deployment that reports its URL; it's a deterrent, not a hard
+	// guarantee, since deployment_url is self-reported by the caller.
+	if lic.ActivatedAt != nil && lic.DeploymentURL != "" && req.DeploymentURL != "" && req.DeploymentURL != lic.DeploymentURL {
+		h.audit("deployment:"+lic.PublicID, "activate_conflict", req.DeploymentURL, "already activated for "+lic.DeploymentURL)
+		c.JSON(http.StatusConflict, gin.H{
+			"error":               "this license is already activated for a different deployment",
+			"activated_for":       lic.DeploymentURL,
+			"contact_support_for": "moving a license to a new deployment",
+		})
+		return
+	}
 
 	ctx, cancel := reqCtx(c)
 	defer cancel()
@@ -85,7 +85,6 @@ func (h *Handler) Activate(c *gin.Context) {
 
 func (h *Handler) FetchLicense(c *gin.Context) {
 	lic := middleware.LicenseFrom(c)
-	h.checkLifecycle(c, lic)
 
 	ctx, cancel := reqCtx(c)
 	defer cancel()
@@ -117,14 +116,9 @@ func (h *Handler) RegisterMachine(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	// Auth middleware already guarantees the license is trial/confirmed —
+	// suspended/expired/revoked never reach here.
 	lic := middleware.LicenseFrom(c)
-	status := h.checkLifecycle(c, lic)
-
-	// Only active licenses may create machines. Expired/suspended → read-only.
-	if status != models.StatusTrial && status != models.StatusConfirmed {
-		c.JSON(http.StatusForbidden, gin.H{"allowed": false, "error": "license is " + status + " — machine creation blocked"})
-		return
-	}
 
 	ctx, cancel := reqCtx(c)
 	defer cancel()
@@ -133,7 +127,7 @@ func (h *Handler) RegisterMachine(c *gin.Context) {
 	// Re-registering a known fingerprint just refreshes it (idempotent).
 	res := h.Store.C("machines").FindOneAndUpdate(ctx,
 		bson.M{"license_id": lic.ID, "fingerprint": req.Fingerprint},
-		bson.M{"$set": bson.M{"last_heartbeat": now, "active": true, "name": req.Name, "tenant_ref": req.TenantRef}},
+		bson.M{"$set": bson.M{"last_heartbeat": now, "active": true, "name": req.Name, "tenant_ref": req.TenantRef, "product": lic.GetProduct()}},
 	)
 	if res.Err() == nil {
 		used, _ := h.Store.C("machines").CountDocuments(ctx, bson.M{"license_id": lic.ID, "active": true})
@@ -165,7 +159,7 @@ func (h *Handler) RegisterMachine(c *gin.Context) {
 	}
 
 	_, err = h.Store.C("machines").InsertOne(ctx, models.Machine{
-		LicenseID: lic.ID, Fingerprint: req.Fingerprint, Name: req.Name,
+		LicenseID: lic.ID, Product: lic.GetProduct(), Fingerprint: req.Fingerprint, Name: req.Name,
 		TenantRef: req.TenantRef, Active: true, FirstSeen: now, LastHeartbeat: now,
 	})
 	if err != nil {
@@ -210,7 +204,6 @@ func (h *Handler) Heartbeat(c *gin.Context) {
 		return
 	}
 	lic := middleware.LicenseFrom(c)
-	status := h.checkLifecycle(c, lic)
 
 	ctx, cancel := reqCtx(c)
 	defer cancel()
@@ -235,10 +228,9 @@ func (h *Handler) Heartbeat(c *gin.Context) {
 	}
 	used, _ := h.Store.C("machines").CountDocuments(ctx, bson.M{"license_id": lic.ID, "active": true})
 	c.JSON(http.StatusOK, gin.H{
-		"status":        status,
+		"status":        lic.Status,
 		"machines_used": used,
 		"machine_quota": lic.MachineQuota,
-		"refresh":       status != models.StatusTrial && status != models.StatusConfirmed, // hint: re-fetch license
 	})
 }
 
@@ -268,7 +260,7 @@ func (h *Handler) CreateQuotaRequest(c *gin.Context) {
 		return
 	}
 	qr := models.QuotaRequest{
-		LicenseID: lic.ID, RequestedDelta: req.RequestedDelta,
+		LicenseID: lic.ID, Product: lic.GetProduct(), RequestedDelta: req.RequestedDelta,
 		Reason: req.Reason, Status: "pending", RequestedAt: time.Now().UTC(),
 	}
 	if _, err := h.Store.C("quota_requests").InsertOne(ctx, qr); err != nil {
@@ -283,7 +275,6 @@ func (h *Handler) CreateQuotaRequest(c *gin.Context) {
 
 func (h *Handler) UpdateChannel(c *gin.Context) {
 	lic := middleware.LicenseFrom(c)
-	h.checkLifecycle(c, lic)
 	if !lic.UpdatesGranted {
 		c.JSON(http.StatusForbidden, gin.H{"updates_granted": false, "error": "updates not granted for this license"})
 		return

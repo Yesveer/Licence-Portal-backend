@@ -56,14 +56,18 @@ func EnsureSuperadmin(store *db.Store, cfg *config.Config) {
 
 /* ───────────── Secret generation helpers ───────────── */
 
-// NewAPIKey returns (plaintext, sha256hex). Plaintext is shown/emailed once;
-// only the hash is stored.
-func NewAPIKey() (string, string) {
+// NewAPIKey returns (plaintext, sha256hex); only the hash is stored.
+// Prefix identifies the product at a glance (wxl_ = PAM, wxe_ = EPM).
+func NewAPIKey(product string) (string, string) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		log.Fatalf("rand failed: %v", err)
 	}
-	key := "wxl_" + base64.RawURLEncoding.EncodeToString(raw)
+	prefix := "wxl_"
+	if product == models.ProductEPM {
+		prefix = "wxe_"
+	}
+	key := prefix + base64.RawURLEncoding.EncodeToString(raw)
 	return key, HashAPIKey(key)
 }
 
@@ -86,12 +90,16 @@ func NewPassword(n int) string {
 
 const publicIDAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
-// NewPublicID returns a human-readable license id like LIC-7K2M9QRT.
-func NewPublicID() string {
+// NewPublicID returns a license id like LIC-7K2M9QRT (pam) or EPM-7K2M9QRT (epm).
+func NewPublicID(product string) string {
 	out := make([]byte, 8)
 	for i := range out {
 		idx, _ := rand.Int(rand.Reader, big.NewInt(int64(len(publicIDAlphabet))))
 		out[i] = publicIDAlphabet[idx.Int64()]
 	}
-	return "LIC-" + string(out)
+	prefix := "LIC-"
+	if product == models.ProductEPM {
+		prefix = "EPM-"
+	}
+	return prefix + string(out)
 }

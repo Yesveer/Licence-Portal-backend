@@ -40,6 +40,11 @@ type Config struct {
 	CORSOrigins  string
 	PortalName   string
 	OfflineGrace int // hours a deployment may run on a cached license
+
+	// KeyRotationGrace: hours the OLD api key keeps working after a rotation,
+	// so an admin has time to update the deployment's LICENSE_API_KEY without
+	// an instant outage. 0 disables the grace window (hard cutover).
+	KeyRotationGrace int
 }
 
 func getenv(key, def string) string {
@@ -88,6 +93,8 @@ func Load() *Config {
 		CORSOrigins:  getenv("CORS_ORIGINS", "http://localhost:3000"),
 		PortalName:   getenv("PORTAL_NAME", "WebXTerm Licensing Portal"),
 		OfflineGrace: getenvInt("OFFLINE_GRACE_HOURS", 72),
+
+		KeyRotationGrace: getenvInt("KEY_ROTATION_GRACE_HOURS", 24),
 	}
 
 	if cfg.JWTSecret == "" {

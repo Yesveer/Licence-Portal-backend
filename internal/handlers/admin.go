@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"golang.org/x/crypto/bcrypt"
 
@@ -55,9 +57,12 @@ func (h *Handler) Login(c *gin.Context) {
 /* ───────────── Plans ───────────── */
 
 func (h *Handler) ListPlans(c *gin.Context) {
-	out := make([]models.Plan, 0, len(models.PlanOrder))
-	for _, id := range models.PlanOrder {
-		out = append(out, models.Plans[id])
+	product := middleware.ProductFrom(c)
+	order := models.ProductPlanOrder(product)
+	plans := models.ProductPlans(product)
+	out := make([]models.Plan, 0, len(order))
+	for _, id := range order {
+		out = append(out, plans[id])
 	}
 	c.JSON(http.StatusOK, gin.H{"plans": out})
 }
@@ -68,18 +73,27 @@ func (h *Handler) Dashboard(c *gin.Context) {
 	ctx, cancel := reqCtx(c)
 	defer cancel()
 	lic := h.Store.C("licenses")
+	product := middleware.ProductFrom(c)
 
-	total, _ := lic.CountDocuments(ctx, bson.M{})
-	trial, _ := lic.CountDocuments(ctx, bson.M{"status": models.StatusTrial})
-	paid, _ := lic.CountDocuments(ctx, bson.M{"status": models.StatusConfirmed})
-	suspended, _ := lic.CountDocuments(ctx, bson.M{"status": bson.M{"$in": []string{models.StatusSuspended, models.StatusExpired}}})
+	// Every count below is scoped to this product's own licenses.
+	licenseIDs, err := h.licenseIDsForProduct(ctx, product)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
+		return
+	}
+
+	total, _ := lic.CountDocuments(ctx, bson.M{"product": product})
+	trial, _ := lic.CountDocuments(ctx, bson.M{"product": product, "status": models.StatusTrial})
+	paid, _ := lic.CountDocuments(ctx, bson.M{"product": product, "status": models.StatusConfirmed})
+	suspended, _ := lic.CountDocuments(ctx, bson.M{"product": product, "status": bson.M{"$in": []string{models.StatusSuspended, models.StatusExpired}}})
 	expiring, _ := lic.CountDocuments(ctx, bson.M{
+		"product":          product,
 		"status":           models.StatusTrial,
 		"trial_expires_at": bson.M{"$lte": time.Now().Add(7 * 24 * time.Hour), "$gte": time.Now()},
 	})
-	machines, _ := h.Store.C("machines").CountDocuments(ctx, bson.M{"active": true})
-	pendingQuota, _ := h.Store.C("quota_requests").CountDocuments(ctx, bson.M{"status": "pending"})
-	unpaid, _ := lic.CountDocuments(ctx, bson.M{"status": models.StatusConfirmed, "amount_paid": false})
+	machines, _ := h.Store.C("machines").CountDocuments(ctx, bson.M{"active": true, "license_id": bson.M{"$in": licenseIDs}})
+	pendingQuota, _ := h.Store.C("quota_requests").CountDocuments(ctx, bson.M{"status": "pending", "license_id": bson.M{"$in": licenseIDs}})
+	unpaid, _ := lic.CountDocuments(ctx, bson.M{"product": product, "status": models.StatusConfirmed, "amount_paid": false})
 
 	c.JSON(http.StatusOK, gin.H{
 		"customers":              total,
@@ -99,7 +113,7 @@ func (h *Handler) OnboardCustomer(c *gin.Context) {
 	var req struct {
 		CompanyName    string `json:"company_name" binding:"required"`
 		Email          string `json:"email" binding:"required,email"`
-		Phone          string `json:"phone"`
+		Phone          string `json:"phone" binding:"required"`
 		DeploymentURL  string `json:"deployment_url"`
 		Plan           string `json:"plan"`
 		MachineQuota   int    `json:"machine_quota"`
@@ -114,7 +128,8 @@ func (h *Handler) OnboardCustomer(c *gin.Context) {
 	if req.Plan == "" {
 		req.Plan = "community"
 	}
-	plan, ok := models.Plans[req.Plan]
+	product := middleware.ProductFrom(c)
+	plan, ok := models.ProductPlans(product)[req.Plan]
 	if !ok {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown plan"})
 		return
@@ -139,22 +154,43 @@ func (h *Handler) OnboardCustomer(c *gin.Context) {
 	defer cancel()
 	now := time.Now().UTC()
 	actor := c.GetString("admin_email")
+	email := strings.ToLower(strings.TrimSpace(req.Email))
 
-	cust := models.Customer{CompanyName: req.CompanyName, Email: req.Email, Phone: req.Phone, CreatedAt: now}
-	custRes, err := h.Store.C("customers").InsertOne(ctx, cust)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "customer create failed"})
+	// Same email onboarding a second product reuses the existing customer
+	// (Products grows to hold both) instead of creating a duplicate row.
+	var existing models.Customer
+	err := h.Store.C("customers").FindOne(ctx, bson.M{"email": email}).Decode(&existing)
+	isNewCustomer := err == mongo.ErrNoDocuments
+	if err != nil && !isNewCustomer {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "customer lookup failed"})
 		return
 	}
-	custID := custRes.InsertedID.(primitive.ObjectID)
 
-	apiKey, apiKeyHash := services.NewAPIKey()
-	password := services.NewPassword(14)
-	passHash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	var custID primitive.ObjectID
+	var password string
+	if isNewCustomer {
+		password = services.NewPassword(14)
+		passHash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+		cust := models.Customer{Products: []string{product}, CompanyName: req.CompanyName, Email: email, Phone: req.Phone, CreatedAt: now}
+		custRes, err := h.Store.C("customers").InsertOne(ctx, cust)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "customer create failed"})
+			return
+		}
+		custID = custRes.InsertedID.(primitive.ObjectID)
+		h.Store.C("customers").UpdateByID(ctx, custID, bson.M{"$set": bson.M{"password_hash": string(passHash)}})
+	} else {
+		custID = existing.ID
+		h.Store.C("customers").UpdateByID(ctx, custID, bson.M{"$addToSet": bson.M{"products": product}})
+		// Same login as their existing product(s) — no new password issued.
+	}
+
+	apiKey, apiKeyHash := services.NewAPIKey(product)
 
 	licDoc := models.License{
 		CustomerID:     custID,
-		PublicID:       services.NewPublicID(),
+		Product:        product,
+		PublicID:       services.NewPublicID(product),
 		Plan:           req.Plan,
 		MachineQuota:   req.MachineQuota,
 		CustomRate:     req.CustomRate,
@@ -181,24 +217,22 @@ func (h *Handler) OnboardCustomer(c *gin.Context) {
 	}
 	licID := licRes.InsertedID.(primitive.ObjectID)
 
-	// Customer-superadmin initial credentials live on the customer record.
-	h.Store.C("customers").UpdateByID(ctx, custID, bson.M{"$set": bson.M{"password_hash": string(passHash)}})
-
 	h.history(licID, "created", "", fmt.Sprintf("plan=%s quota=%d", req.Plan, req.MachineQuota), actor, "onboarding")
 	h.audit(actor, "onboard_customer", licDoc.PublicID, req.CompanyName)
 
 	subject, body := services.OnboardingEmail(
-		h.Cfg.PortalName, req.CompanyName, req.Email, password, apiKey,
-		licDoc.PublicID, req.DeploymentURL, req.MachineQuota, h.Cfg.TrialDays,
+		h.Cfg.PortalName, req.CompanyName, email, password, apiKey,
+		licDoc.PublicID, req.DeploymentURL, plan.Name, plan.Trial, req.MachineQuota, h.Cfg.TrialDays, licDoc.CreatedAt,
 	)
-	h.Mailer.SendAsync(req.Email, subject, body)
+	h.Mailer.SendAsync(email, subject, body)
 
 	c.JSON(http.StatusCreated, gin.H{
 		"customer_id": custID.Hex(),
 		"license_id":  licID.Hex(),
 		"public_id":   licDoc.PublicID,
-		"api_key":     apiKey,   // shown once
-		"password":    password, // shown once, emailed
+		"api_key":     apiKey,             // shown once
+		"password":    password,           // shown once, emailed — "" if this customer already had an account
+		"new_customer": isNewCustomer,
 		"status":      licDoc.Status,
 		"quota":       licDoc.MachineQuota,
 	})
@@ -210,7 +244,7 @@ func (h *Handler) ListLicenses(c *gin.Context) {
 	ctx, cancel := reqCtx(c)
 	defer cancel()
 
-	filter := bson.M{}
+	filter := bson.M{"product": middleware.ProductFrom(c)}
 	if s := c.Query("status"); s != "" {
 		filter["status"] = s
 	}
@@ -283,7 +317,7 @@ func (h *Handler) GetLicense(c *gin.Context) {
 		return
 	}
 	var lic models.License
-	if err := h.Store.C("licenses").FindOne(ctx, bson.M{"_id": id}).Decode(&lic); err != nil {
+	if err := h.Store.C("licenses").FindOne(ctx, bson.M{"_id": id, "product": middleware.ProductFrom(c)}).Decode(&lic); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "license not found"})
 		return
 	}
@@ -338,11 +372,14 @@ func (h *Handler) GetLicense(c *gin.Context) {
 
 /* ───────────── Update license ───────────── */
 
+// UpdateLicense changes machine quota (up or down) and extends validity for
+// the plan already in place — changing the plan tier goes through
+// UpgradeLicense, and suspend/revoke through SetLicenseStatus, so neither is
+// accepted here. Never rotates the API key, so its notification email never
+// includes one.
 func (h *Handler) UpdateLicense(c *gin.Context) {
 	var req struct {
 		MachineQuota   *int    `json:"machine_quota"`
-		Plan           *string `json:"plan"`
-		Status         *string `json:"status"`
 		UpdatesGranted *bool   `json:"updates_granted"`
 		UpdateChannel  *string `json:"update_channel"`
 		CustomRate     *int    `json:"custom_rate"`
@@ -364,50 +401,27 @@ func (h *Handler) UpdateLicense(c *gin.Context) {
 	defer cancel()
 
 	var lic models.License
-	if err := h.Store.C("licenses").FindOne(ctx, bson.M{"_id": id}).Decode(&lic); err != nil {
+	if err := h.Store.C("licenses").FindOne(ctx, bson.M{"_id": id, "product": middleware.ProductFrom(c)}).Decode(&lic); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "license not found"})
 		return
 	}
+	plans := models.ProductPlans(lic.GetProduct())
 
 	actor := c.GetString("admin_email")
 	set := bson.M{"updated_at": time.Now().UTC()}
 
-	targetPlan := lic.Plan
-	if req.Plan != nil && *req.Plan != lic.Plan {
-		if _, ok := models.Plans[*req.Plan]; !ok {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "unknown plan"})
-			return
-		}
-		targetPlan = *req.Plan
-		set["plan"] = targetPlan
-		h.history(id, "plan", lic.Plan, targetPlan, actor, req.Reason)
-	}
 	if req.MachineQuota != nil && *req.MachineQuota != lic.MachineQuota {
-		plan := models.Plans[targetPlan]
-		if plan.MaxMachines > 0 && *req.MachineQuota > plan.MaxMachines {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("plan %s allows at most %d machines — upgrade the plan first", plan.Name, plan.MaxMachines)})
-			return
-		}
 		if *req.MachineQuota < 1 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "quota must be >= 1"})
 			return
 		}
-		set["machine_quota"] = *req.MachineQuota
-		h.history(id, "machine_quota", strconv.Itoa(lic.MachineQuota), strconv.Itoa(*req.MachineQuota), actor, req.Reason)
-	}
-	if req.Status != nil && *req.Status != lic.Status {
-		valid := map[string]bool{models.StatusTrial: true, models.StatusConfirmed: true, models.StatusSuspended: true, models.StatusExpired: true, models.StatusRevoked: true}
-		if !valid[*req.Status] {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid status"})
+		plan := plans[lic.Plan]
+		if plan.MaxMachines > 0 && *req.MachineQuota > plan.MaxMachines {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("plan %s allows at most %d machines — upgrade the plan first", plan.Name, plan.MaxMachines)})
 			return
 		}
-		set["status"] = *req.Status
-		// trial → confirmed sets a paid expiry a month out by default
-		if lic.Status == models.StatusTrial && *req.Status == models.StatusConfirmed && lic.ExpiresAt == nil {
-			exp := time.Now().UTC().Add(30 * 24 * time.Hour)
-			set["expires_at"] = exp
-		}
-		h.history(id, "status", lic.Status, *req.Status, actor, req.Reason)
+		set["machine_quota"] = *req.MachineQuota
+		h.history(id, "machine_quota", strconv.Itoa(lic.MachineQuota), strconv.Itoa(*req.MachineQuota), actor, req.Reason)
 	}
 	if req.UpdatesGranted != nil && *req.UpdatesGranted != lic.UpdatesGranted {
 		set["updates_granted"] = *req.UpdatesGranted
@@ -451,12 +465,101 @@ func (h *Handler) UpdateLicense(c *gin.Context) {
 	}
 	h.audit(actor, "update_license", lic.PublicID, req.Reason)
 
+	// notify the customer only for changes they'd actually notice — never
+	// includes an API key, since this endpoint never rotates one.
+	var summary []string
+	if req.MachineQuota != nil && *req.MachineQuota != lic.MachineQuota {
+		summary = append(summary, fmt.Sprintf("machine quota: %d → %d", lic.MachineQuota, *req.MachineQuota))
+	}
+	if req.ExtendDays != nil && *req.ExtendDays != 0 {
+		summary = append(summary, fmt.Sprintf("validity extended by %d day(s)", *req.ExtendDays))
+	}
+	if len(summary) > 0 {
+		var cust models.Customer
+		h.Store.C("customers").FindOne(ctx, bson.M{"_id": lic.CustomerID}).Decode(&cust)
+		subject, body := services.LicenseUpdateEmail(h.Cfg.PortalName, cust.CompanyName, lic.PublicID, strings.Join(summary, " · "), time.Now().UTC())
+		h.Mailer.SendAsync(cust.Email, subject, body)
+	}
+
+	var updated models.License
+	h.Store.C("licenses").FindOne(ctx, bson.M{"_id": id}).Decode(&updated)
+	c.JSON(http.StatusOK, gin.H{"license": updated})
+}
+
+/* ───────────── Suspend / reactivate / revoke ───────────── */
+
+// SetLicenseStatus is the only way to suspend, reactivate, or revoke a
+// license. Revoked is permanent — nothing can move a license out of it here
+// short of issuing a new one. Enforcement is immediate: APIKeyAuth rejects
+// any license whose status isn't trial/confirmed on the very next deployment
+// call, key rotation or not.
+func (h *Handler) SetLicenseStatus(c *gin.Context) {
+	var req struct {
+		Status string `json:"status" binding:"required"`
+		Reason string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := primitive.ObjectIDFromHex(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad id"})
+		return
+	}
+	ctx, cancel := reqCtx(c)
+	defer cancel()
+
+	var lic models.License
+	if err := h.Store.C("licenses").FindOne(ctx, bson.M{"_id": id, "product": middleware.ProductFrom(c)}).Decode(&lic); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "license not found"})
+		return
+	}
+	if lic.Status == models.StatusRevoked {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "license is revoked — permanent, issue a new license instead"})
+		return
+	}
+	allowed := map[string]bool{models.StatusSuspended: true, models.StatusConfirmed: true, models.StatusRevoked: true}
+	if !allowed[req.Status] {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "status must be suspended, confirmed (reactivate), or revoked"})
+		return
+	}
+	if req.Status == lic.Status {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "already " + lic.Status})
+		return
+	}
+
+	actor := c.GetString("admin_email")
+	if _, err := h.Store.C("licenses").UpdateByID(ctx, id, bson.M{"$set": bson.M{"status": req.Status, "updated_at": time.Now().UTC()}}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "update failed"})
+		return
+	}
+	h.history(id, "status", lic.Status, req.Status, actor, req.Reason)
+	h.audit(actor, "set_license_status", lic.PublicID, fmt.Sprintf("%s -> %s", lic.Status, req.Status))
+
 	var updated models.License
 	h.Store.C("licenses").FindOne(ctx, bson.M{"_id": id}).Decode(&updated)
 	c.JSON(http.StatusOK, gin.H{"license": updated})
 }
 
 /* ───────────── Rotate API key ───────────── */
+
+// rotationSet builds the $set fields for any operation that rotates the API
+// key: the old key keeps working for KeyRotationGrace hours (0 = hard
+// cutover, matching the old instant-invalidate behavior) so an admin has a
+// window to update the deployment's LICENSE_API_KEY.
+func (h *Handler) rotationSet(oldHash, newHash string) bson.M {
+	set := bson.M{"api_key_hash": newHash, "updated_at": time.Now().UTC()}
+	if h.Cfg.KeyRotationGrace > 0 && oldHash != "" {
+		set["prev_api_key_hash"] = oldHash
+		grace := time.Now().UTC().Add(time.Duration(h.Cfg.KeyRotationGrace) * time.Hour)
+		set["prev_api_key_expires_at"] = grace
+	} else {
+		set["prev_api_key_hash"] = ""
+		set["prev_api_key_expires_at"] = nil
+	}
+	return set
+}
 
 func (h *Handler) RotateAPIKey(c *gin.Context) {
 	id, err := primitive.ObjectIDFromHex(c.Param("id"))
@@ -467,8 +570,13 @@ func (h *Handler) RotateAPIKey(c *gin.Context) {
 	ctx, cancel := reqCtx(c)
 	defer cancel()
 
-	apiKey, hash := services.NewAPIKey()
-	res, err := h.Store.C("licenses").UpdateByID(ctx, id, bson.M{"$set": bson.M{"api_key_hash": hash, "updated_at": time.Now().UTC()}})
+	var lic models.License
+	if err := h.Store.C("licenses").FindOne(ctx, bson.M{"_id": id, "product": middleware.ProductFrom(c)}).Decode(&lic); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "license not found"})
+		return
+	}
+	apiKey, hash := services.NewAPIKey(lic.GetProduct())
+	res, err := h.Store.C("licenses").UpdateByID(ctx, id, bson.M{"$set": h.rotationSet(lic.APIKeyHash, hash)})
 	if err != nil || res.MatchedCount == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "license not found"})
 		return
@@ -476,7 +584,131 @@ func (h *Handler) RotateAPIKey(c *gin.Context) {
 	actor := c.GetString("admin_email")
 	h.history(id, "api_key", "(rotated)", "(rotated)", actor, "key rotation")
 	h.audit(actor, "rotate_api_key", id.Hex(), "")
+
+	var cust models.Customer
+	h.Store.C("customers").FindOne(ctx, bson.M{"_id": lic.CustomerID}).Decode(&cust)
+	subject, body := services.KeyRotatedEmail(h.Cfg.PortalName, cust.CompanyName, lic.PublicID, apiKey, time.Now().UTC())
+	h.Mailer.SendAsync(cust.Email, subject, body)
+
 	c.JSON(http.StatusOK, gin.H{"api_key": apiKey}) // shown once
+}
+
+/* ───────────── Upgrade plan ───────────── */
+
+// planRank returns a plan's position in the product's tier order (higher =
+// more capable), used only to tell an upgrade from a demotion for wording.
+func planRank(product, planID string) int {
+	for i, id := range models.ProductPlanOrder(product) {
+		if id == planID {
+			return i
+		}
+	}
+	return -1
+}
+
+// UpgradeLicense moves a license to a different plan tier (e.g. Community →
+// Professional, or a demotion the other way). The customer's login is
+// untouched, but the deployment API key always rotates — the old one stops
+// working the moment this runs — and an email goes out with the new plan/
+// quota and the new key.
+func (h *Handler) UpgradeLicense(c *gin.Context) {
+	var req struct {
+		Plan         string `json:"plan" binding:"required"`
+		MachineQuota int    `json:"machine_quota"`
+		Reason       string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := primitive.ObjectIDFromHex(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad id"})
+		return
+	}
+	ctx, cancel := reqCtx(c)
+	defer cancel()
+
+	var lic models.License
+	if err := h.Store.C("licenses").FindOne(ctx, bson.M{"_id": id, "product": middleware.ProductFrom(c)}).Decode(&lic); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "license not found"})
+		return
+	}
+	if req.Plan == lic.Plan {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "already on this plan"})
+		return
+	}
+	plans := models.ProductPlans(lic.GetProduct())
+	oldPlan, ok := plans[lic.Plan]
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "current plan unrecognized"})
+		return
+	}
+	newPlan, ok := plans[req.Plan]
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown plan"})
+		return
+	}
+
+	quota := req.MachineQuota
+	if quota <= 0 {
+		if newPlan.MaxMachines > 0 {
+			quota = newPlan.MaxMachines
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "machine_quota required for enterprise"})
+			return
+		}
+	}
+	if newPlan.MaxMachines > 0 && quota > newPlan.MaxMachines {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("plan %s allows at most %d machines", newPlan.Name, newPlan.MaxMachines)})
+		return
+	}
+
+	direction := "plan upgrade"
+	if planRank(lic.GetProduct(), req.Plan) < planRank(lic.GetProduct(), lic.Plan) {
+		direction = "plan demotion"
+	}
+
+	apiKey, hash := services.NewAPIKey(lic.GetProduct())
+	now := time.Now().UTC()
+	set := h.rotationSet(lic.APIKeyHash, hash)
+	set["plan"] = req.Plan
+	set["machine_quota"] = quota
+	unset := bson.M{}
+
+	// leaving a trial plan for a paid one confirms the license and starts a
+	// fresh paid period; trial_expires_at no longer applies.
+	if oldPlan.Trial && !newPlan.Trial && lic.Status == models.StatusTrial {
+		set["status"] = models.StatusConfirmed
+		set["expires_at"] = now.Add(30 * 24 * time.Hour)
+		unset["trial_expires_at"] = ""
+	}
+
+	update := bson.M{"$set": set}
+	if len(unset) > 0 {
+		update["$unset"] = unset
+	}
+	if _, err := h.Store.C("licenses").UpdateByID(ctx, id, update); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "upgrade failed"})
+		return
+	}
+
+	actor := c.GetString("admin_email")
+	h.history(id, "plan", lic.Plan, req.Plan, actor, req.Reason)
+	if quota != lic.MachineQuota {
+		h.history(id, "machine_quota", strconv.Itoa(lic.MachineQuota), strconv.Itoa(quota), actor, req.Reason)
+	}
+	h.history(id, "api_key", "(rotated)", "(rotated)", actor, direction)
+	h.audit(actor, "upgrade_license", lic.PublicID, fmt.Sprintf("%s -> %s", lic.Plan, req.Plan))
+
+	var cust models.Customer
+	h.Store.C("customers").FindOne(ctx, bson.M{"_id": lic.CustomerID}).Decode(&cust)
+	subject, body := services.UpgradeEmail(h.Cfg.PortalName, cust.CompanyName, cust.Email, oldPlan.Name, newPlan.Name, apiKey, lic.PublicID, quota, now)
+	h.Mailer.SendAsync(cust.Email, subject, body)
+
+	var updated models.License
+	h.Store.C("licenses").FindOne(ctx, bson.M{"_id": id}).Decode(&updated)
+	c.JSON(http.StatusOK, gin.H{"license": updated, "api_key": apiKey}) // key shown once
 }
 
 /* ───────────── Payments ───────────── */
@@ -504,15 +736,23 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 	ctx, cancel := reqCtx(c)
 	defer cancel()
 
+	count, err := h.Store.C("licenses").CountDocuments(ctx, bson.M{"_id": id, "product": middleware.ProductFrom(c)})
+	if err != nil || count == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "license not found"})
+		return
+	}
+
 	p := models.Payment{
-		LicenseID: id, Amount: req.Amount, Currency: req.Currency,
+		LicenseID: id, Product: middleware.ProductFrom(c), Amount: req.Amount, Currency: req.Currency,
 		Method: req.Method, Reference: req.Reference,
 		PaidAt: time.Now().UTC(), CoversPeriod: req.CoversPeriod,
 	}
-	if _, err := h.Store.C("payments").InsertOne(ctx, p); err != nil {
+	res, err := h.Store.C("payments").InsertOne(ctx, p)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "payment insert failed"})
 		return
 	}
+	p.ID = res.InsertedID.(primitive.ObjectID)
 	h.Store.C("licenses").UpdateByID(ctx, id, bson.M{"$set": bson.M{"amount_paid": true, "updated_at": time.Now().UTC()}})
 	actor := c.GetString("admin_email")
 	h.history(id, "payment", "", fmt.Sprintf("%d %s (%s)", req.Amount, req.Currency, req.Method), actor, req.CoversPeriod)
@@ -526,7 +766,13 @@ func (h *Handler) ListQuotaRequests(c *gin.Context) {
 	ctx, cancel := reqCtx(c)
 	defer cancel()
 
-	filter := bson.M{}
+	// Scope via license IDs — quota_requests has no product field of its own.
+	licenseIDs, err := h.licenseIDsForProduct(ctx, middleware.ProductFrom(c))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
+		return
+	}
+	filter := bson.M{"license_id": bson.M{"$in": licenseIDs}}
 	if s := c.Query("status"); s != "" {
 		filter["status"] = s
 	}
@@ -583,7 +829,7 @@ func (h *Handler) DecideQuotaRequest(c *gin.Context) {
 	}
 
 	var lic models.License
-	if err := h.Store.C("licenses").FindOne(ctx, bson.M{"_id": qr.LicenseID}).Decode(&lic); err != nil {
+	if err := h.Store.C("licenses").FindOne(ctx, bson.M{"_id": qr.LicenseID, "product": middleware.ProductFrom(c)}).Decode(&lic); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "license not found"})
 		return
 	}
@@ -596,7 +842,7 @@ func (h *Handler) DecideQuotaRequest(c *gin.Context) {
 
 	if req.Approve {
 		newQuota = lic.MachineQuota + qr.RequestedDelta
-		plan := models.Plans[lic.Plan]
+		plan := models.ProductPlans(lic.GetProduct())[lic.Plan]
 		if plan.MaxMachines > 0 && newQuota > plan.MaxMachines {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("approving would exceed plan ceiling (%d) — upgrade the plan first", plan.MaxMachines)})
 			return
